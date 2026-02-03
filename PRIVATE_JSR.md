@@ -1,436 +1,428 @@
-# Private JSR Registry - Implementation Plan
+# Private JSR Registry - Minimal Implementation
 
-This document outlines the architecture and implementation plan for a private JSR (JavaScript Registry) that acts as an overlay on top of the public jsr.io registry. Private packages are served locally while public packages are transparently proxied.
+A minimal private JSR registry using only the filesystem for persistence. Acts as an overlay on public jsr.io - private packages are served locally, everything else proxies transparently.
 
-## Overview
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     Client (Deno/npm)                        │
-└─────────────────────────┬────────────────────────────────────┘
-                          │
-                          ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   Private JSR Proxy                          │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  1. Parse request (scope, package, version, path)      │  │
-│  │  2. Check: Is @scope/package in private registry?      │  │
-│  │     ├─ YES → Serve from local storage                  │  │
-│  │     └─ NO  → Proxy to public jsr.io/npm.jsr.io         │  │
-│  └────────────────────────────────────────────────────────┘  │
-└───────────┬──────────────────────────────────┬───────────────┘
-            │                                  │
-            ▼                                  ▼
-┌───────────────────────┐          ┌───────────────────────────┐
-│   Local Storage       │          │     Public JSR.io         │
-│  /storage/            │          │   (transparent proxy)     │
-│   @scope/pkg/meta.json│          │                           │
-│   @scope/pkg/1.0.0/   │          │                           │
-└───────────────────────┘          └───────────────────────────┘
-```
-
-## JSR API Architecture
-
-### Three API Domains
-
-| Domain | Purpose |
-|--------|---------|
-| `jsr.io` | Registry API - download modules/metadata |
-| `npm.jsr.io` | npm compatibility - tarballs/package.json |
-| `api.jsr.io` | Management API - publishing, scopes, auth |
-
-### Key URL Patterns
+## Architecture
 
 ```
-# Package metadata
-https://jsr.io/@{scope}/{package}/meta.json
-https://jsr.io/@{scope}/{package}/{version}_meta.json
-
-# Source files
-https://jsr.io/@{scope}/{package}/{version}/{path}
-
-# NPM compatibility
-https://npm.jsr.io/@jsr/{scope}__{package}
-https://npm.jsr.io/~/11/@jsr/{scope}__{package}/{version}.tgz
+┌─────────────────────────────────────────────────────────────┐
+│                    Client (Deno)                            │
+│                  JSR_URL=http://localhost:4873              │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Private JSR Proxy                          │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  Request → Is private scope? → YES → Local filesystem │  │
+│  │                              → NO  → Proxy to jsr.io  │  │
+│  └───────────────────────────────────────────────────────┘  │
+└──────────┬─────────────────────────────────┬────────────────┘
+           │                                 │
+           ▼                                 ▼
+┌─────────────────────┐           ┌─────────────────────────┐
+│  ./storage/         │           │  https://jsr.io         │
+│  @scope/pkg/...     │           │  (transparent proxy)    │
+└─────────────────────┘           └─────────────────────────┘
 ```
 
-## Publishing Flow
+## Filesystem Structure
 
-### How `deno publish` Works
+All state lives in a single `./storage` directory:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         deno publish flow                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  1. Read jsr.json/deno.json → extract @scope/package@version            │
-│  2. Check auth token (or initiate device OAuth flow)                    │
-│  3. Create gzipped tarball of package files                             │
-│  4. POST to /api/scopes/{scope}/packages/{package}/versions/{version}   │
-│     - Query: ?config=/jsr.json                                          │
-│     - Headers: Content-Encoding: gzip, Content-Type: application/x-tar  │
-│     - Body: gzipped tar archive                                         │
-│  5. Poll GET /api/publishing_tasks/{id} until success/failure           │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+./storage/
+├── .tokens                           # Auth tokens (one per line)
+├── .tasks/                           # Publishing tasks
+│   └── {uuid}.json                   # Task status file
+│
+└── @{scope}/
+    └── {package}/
+        ├── meta.json                 # Package metadata
+        ├── {version}_meta.json       # Version metadata
+        └── {version}/                # Source files
+            ├── mod.ts
+            └── lib/utils.ts
 ```
 
-### API Endpoints Required
+## API Endpoints
+
+Only 4 endpoints are needed:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/authorizations` | POST | Start device OAuth flow |
-| `/api/authorizations/exchange` | POST | Exchange code for token |
-| `/api/authorizations/details/:code` | GET | Check auth status |
-| `/api/scopes/:scope/packages/:package/versions/:version` | POST | Upload package |
+| `/api/scopes/:scope/packages/:package/versions/:version` | POST | Publish package |
 | `/api/publishing_tasks/:id` | GET | Poll publish status |
+| `/@:scope/:package/*` | GET | Serve files / proxy to jsr.io |
+| `/api/authorizations/*` | POST | Simple token auth |
 
-## Storage Structure
+## Metadata Formats
 
-The storage structure mirrors jsr.io's layout:
-
-```
-/storage/
-├── publishing_tasks/
-│   └── {uuid}.tar.gz              # Temporary upload storage
-├── @{scope}/
-│   └── {package}/
-│       ├── meta.json              # Package metadata
-│       ├── {version}_meta.json    # Version metadata
-│       └── {version}/
-│           ├── mod.ts
-│           └── lib/
-│               └── utils.ts
-└── npm/
-    └── @jsr/
-        └── {scope}__{package}/
-            ├── package.json       # npm manifest
-            └── {version}.tgz      # npm tarball
-```
-
-### Metadata File Formats
-
-**meta.json** (Package metadata):
+**meta.json** - Package metadata:
 ```json
 {
   "scope": "myorg",
   "name": "private-pkg",
   "latest": "1.0.0",
   "versions": {
-    "1.0.0": { "yanked": false }
+    "1.0.0": {}
   }
 }
 ```
 
-**{version}_meta.json** (Version metadata):
+**{version}_meta.json** - Version metadata:
 ```json
 {
-  "manifest": {
-    "/mod.ts": { "size": 234, "checksum": "sha256-..." }
-  },
   "exports": { ".": "./mod.ts" },
-  "moduleGraph2": { ... }
+  "manifest": {
+    "/mod.ts": { "size": 234, "checksum": "sha256-abc123..." }
+  }
 }
 ```
 
-## Implementation Components
+## Implementation
 
-### 1. Proxy Server Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                    Private JSR Registry Server                         │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────────┐   │
-│  │   Auth       │   │   Publish    │   │   Registry (Read)        │   │
-│  │   Endpoints  │   │   Endpoint   │   │   Endpoints              │   │
-│  ├──────────────┤   ├──────────────┤   ├──────────────────────────┤   │
-│  │ POST /auth   │   │ POST /api/   │   │ GET /@scope/pkg/meta.json│   │
-│  │ POST /exchg  │   │ scopes/../   │   │ GET /@scope/pkg/1.0.0/.. │   │
-│  │              │   │ versions/..  │   │ GET /npm/@jsr/...        │   │
-│  └──────┬───────┘   └──────┬───────┘   └────────────┬─────────────┘   │
-│         │                  │                        │                  │
-│         ▼                  ▼                        ▼                  │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                     Request Router                                │ │
-│  │  ┌─────────────────────────────────────────────────────────────┐ │ │
-│  │  │  Is this a private scope/package?                           │ │ │
-│  │  │    YES → Handle locally                                     │ │ │
-│  │  │    NO  → Proxy to public jsr.io                             │ │ │
-│  │  └─────────────────────────────────────────────────────────────┘ │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-│                                                                        │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                     Local Storage                                 │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-│                                                                        │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                     SQLite Database                               │ │
-│  │  - tokens (auth tokens)                                           │ │
-│  │  - publishing_tasks (status, errors)                              │ │
-│  │  - packages (scope, name, latest)                                 │ │
-│  │  - package_versions (version, manifest)                           │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### 2. Core Request Handler
+### Main Server
 
 ```typescript
-// Core routing logic
-async function handleRequest(req: Request): Promise<Response> {
+// server.ts
+const STORAGE_DIR = "./storage";
+const PRIVATE_SCOPES = new Set(["myorg", "internal"]); // Configure your private scopes
+
+Deno.serve({ port: 4873 }, async (req) => {
   const url = new URL(req.url);
   const path = url.pathname;
 
-  // Handle API routes (publishing, auth)
-  if (path.startsWith("/api/")) {
-    return handleApiRoute(req, path);
+  // Publishing endpoint
+  if (req.method === "POST" && path.match(/^\/api\/scopes\/([^/]+)\/packages\/([^/]+)\/versions\/([^/]+)$/)) {
+    return handlePublish(req, path, url.searchParams.get("config") ?? "/jsr.json");
   }
 
-  // Handle npm registry routes
-  if (path.startsWith("/npm/") || path.startsWith("/@jsr/")) {
-    return handleNpmRoute(req, path);
+  // Poll publishing task
+  if (req.method === "GET" && path.startsWith("/api/publishing_tasks/")) {
+    return handleTaskStatus(path.split("/").pop()!);
   }
 
-  // Handle JSR registry routes (/@scope/package/...)
-  const parsed = parseJsrPath(path);
-
-  if (parsed && isPrivatePackage(parsed.scope, parsed.package)) {
-    return serveFromLocalStorage(parsed);
+  // Auth endpoints (auto-approve for simplicity)
+  if (path.startsWith("/api/authorizations")) {
+    return handleAuth(req, path);
   }
 
-  // Proxy to public registry
-  return proxyToPublic(req, path);
+  // Serve files - check if private, otherwise proxy
+  return handleFileRequest(path);
+});
+```
+
+### File Request Handler
+
+```typescript
+async function handleFileRequest(path: string): Promise<Response> {
+  // Parse: /@scope/package/...
+  const match = path.match(/^\/@([^/]+)\/([^/]+)/);
+  if (!match) {
+    return proxyToJsr(path);
+  }
+
+  const [, scope] = match;
+
+  // Private scope? Serve from filesystem
+  if (PRIVATE_SCOPES.has(scope)) {
+    const filePath = `${STORAGE_DIR}/${path}`;
+    try {
+      const content = await Deno.readFile(filePath);
+      return new Response(content, {
+        headers: { "content-type": getContentType(filePath) }
+      });
+    } catch {
+      return new Response("Not found", { status: 404 });
+    }
+  }
+
+  // Public scope - proxy to jsr.io
+  return proxyToJsr(path);
+}
+
+async function proxyToJsr(path: string): Promise<Response> {
+  const resp = await fetch(`https://jsr.io${path}`);
+  return new Response(resp.body, {
+    status: resp.status,
+    headers: resp.headers
+  });
+}
+
+function getContentType(path: string): string {
+  if (path.endsWith(".ts")) return "text/typescript";
+  if (path.endsWith(".js")) return "text/javascript";
+  if (path.endsWith(".json")) return "application/json";
+  return "application/octet-stream";
 }
 ```
 
-### 3. Publish Handler
+### Publish Handler
 
 ```typescript
-async function handlePublish(req: Request): Promise<Response> {
-  const { scope, package: pkg, version } = parseParams(req);
+async function handlePublish(req: Request, path: string, configPath: string): Promise<Response> {
+  // Parse URL: /api/scopes/{scope}/packages/{package}/versions/{version}
+  const match = path.match(/^\/api\/scopes\/([^/]+)\/packages\/([^/]+)\/versions\/([^/]+)$/);
+  if (!match) return new Response("Bad request", { status: 400 });
 
-  // 1. Verify auth token
-  const token = req.headers.get("Authorization")?.replace("Bearer ", "");
-  if (!verifyToken(token, scope)) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-
-  // 2. Get config path from query
-  const configPath = new URL(req.url).searchParams.get("config");
-
-  // 3. Stream tarball to temp storage, compute SHA256
+  const [, scope, pkg, version] = match;
   const taskId = crypto.randomUUID();
-  const tarballPath = `publishing_tasks/${taskId}.tar.gz`;
-  const hash = await streamToStorage(req.body, tarballPath);
 
-  // 4. Create publishing task record
-  await db.insert("publishing_tasks", {
+  // Save task status
+  await Deno.mkdir(`${STORAGE_DIR}/.tasks`, { recursive: true });
+  await writeJson(`${STORAGE_DIR}/.tasks/${taskId}.json`, {
     id: taskId,
     scope, package: pkg, version,
-    config_file: configPath,
-    status: "pending"
+    configPath,
+    status: "processing"
   });
 
-  // 5. Queue async processing
-  processPublishingTask(taskId);
+  // Process tarball in background
+  processTarball(taskId, req, scope, pkg, version, configPath);
 
-  // 6. Return task ID for polling
-  return Response.json({
-    id: taskId,
-    status: "pending"
-  });
+  return Response.json({ id: taskId, status: "processing" });
 }
-```
 
-### 4. Tarball Processing
-
-```typescript
-async function processPublishingTask(taskId: string) {
-  await db.update("publishing_tasks", taskId, { status: "processing" });
+async function processTarball(
+  taskId: string,
+  req: Request,
+  scope: string,
+  pkg: string,
+  version: string,
+  configPath: string
+) {
+  const taskFile = `${STORAGE_DIR}/.tasks/${taskId}.json`;
 
   try {
-    const task = await db.get("publishing_tasks", taskId);
-    const tarball = await readTarball(`publishing_tasks/${taskId}.tar.gz`);
+    // Read and decompress tarball
+    const gzipped = new Uint8Array(await req.arrayBuffer());
+    const tarData = gunzip(gzipped);
+    const files = untar(tarData);
 
-    // 1. Extract and validate files
-    const files = await extractTarball(tarball);
-    validateFiles(files); // size limits, no symlinks, etc.
+    // Parse config
+    const configContent = files.get(configPath.replace(/^\//, ""));
+    if (!configContent) throw new Error("configFileNotFound");
 
-    // 2. Parse config file (jsr.json)
-    const config = JSON.parse(files[task.config_file]);
-    if (config.name !== `@${task.scope}/${task.package}`) {
-      throw new Error("configFileNameMismatch");
+    const config = JSON.parse(new TextDecoder().decode(configContent));
+
+    // Validate name/version match
+    if (config.name !== `@${scope}/${pkg}`) throw new Error("configFileNameMismatch");
+    if (config.version !== version) throw new Error("configFileVersionMismatch");
+
+    // Write files and build manifest
+    const manifest: Record<string, { size: number; checksum: string }> = {};
+    const versionDir = `${STORAGE_DIR}/@${scope}/${pkg}/${version}`;
+
+    for (const [filePath, content] of files) {
+      const fullPath = `${versionDir}/${filePath}`;
+      await Deno.mkdir(dirname(fullPath), { recursive: true });
+      await Deno.writeFile(fullPath, content);
+
+      const hash = await crypto.subtle.digest("SHA-256", content);
+      const checksum = "sha256-" + encodeHex(new Uint8Array(hash));
+      manifest["/" + filePath] = { size: content.length, checksum };
     }
-    if (config.version !== task.version) {
-      throw new Error("configFileVersionMismatch");
-    }
 
-    // 3. Build manifest with checksums
-    const manifest = {};
-    for (const [path, content] of Object.entries(files)) {
-      const checksum = await sha256(content);
-      manifest[path] = { size: content.length, checksum: `sha256-${checksum}` };
+    // Write version metadata
+    await writeJson(`${STORAGE_DIR}/@${scope}/${pkg}/${version}_meta.json`, {
+      exports: config.exports ?? { ".": "./mod.ts" },
+      manifest
+    });
 
-      // 4. Write file to storage
-      await writeFile(`@${task.scope}/${task.package}/${task.version}${path}`, content);
-    }
+    // Update package metadata
+    const metaPath = `${STORAGE_DIR}/@${scope}/${pkg}/meta.json`;
+    const meta = await readJsonOr(metaPath, { scope, name: pkg, versions: {} });
+    meta.versions[version] = {};
+    meta.latest = version;
+    await writeJson(metaPath, meta);
 
-    // 5. Create version metadata
-    const versionMeta = {
-      exports: config.exports,
-      manifest,
-      moduleGraph2: buildModuleGraph(files, config)
-    };
-    await writeJson(
-      `@${task.scope}/${task.package}/${task.version}_meta.json`,
-      versionMeta
-    );
-
-    // 6. Update package metadata
-    const pkgMeta = await readJson(`@${task.scope}/${task.package}/meta.json`)
-      ?? { scope: task.scope, name: task.package, versions: {} };
-    pkgMeta.versions[task.version] = { yanked: false };
-    pkgMeta.latest = task.version;
-    await writeJson(`@${task.scope}/${task.package}/meta.json`, pkgMeta);
-
-    // 7. Generate npm compatibility files (optional)
-    await generateNpmTarball(task, files, config);
-
-    // 8. Mark success
-    await db.update("publishing_tasks", taskId, { status: "success" });
+    // Mark success
+    await writeJson(taskFile, { id: taskId, status: "success" });
 
   } catch (error) {
-    await db.update("publishing_tasks", taskId, {
+    await writeJson(taskFile, {
+      id: taskId,
       status: "failure",
-      error: { code: error.message, message: error.toString() }
+      error: { code: error.message, message: String(error) }
     });
   }
 }
 ```
 
-### 5. Authentication (Simplified for Private Use)
+### Task Status Handler
 
 ```typescript
-// Device auth flow - simplified for private use
-const pendingAuths = new Map<string, { verifier?: string, approved: boolean }>();
-
-// POST /api/authorizations - Start auth
-app.post("/api/authorizations", async (req) => {
-  const { challenge } = await req.json();
-  const code = generateCode(); // "ABCD-EFGH"
-  const exchangeToken = generateToken();
-
-  pendingAuths.set(exchangeToken, { approved: false });
-
-  return Response.json({
-    verification_url: "http://localhost:8080/auth",
-    code,
-    exchange_token: exchangeToken,
-    expires_at: new Date(Date.now() + 600000).toISOString(),
-    poll_interval: 2
-  });
-});
-
-// POST /api/authorizations/exchange - Get token
-app.post("/api/authorizations/exchange", async (req) => {
-  const { exchange_token, verifier } = await req.json();
-  const auth = pendingAuths.get(exchange_token);
-
-  if (!auth?.approved) {
-    return new Response("Pending", { status: 400 });
-  }
-
-  // Generate permanent token
-  const token = `jsrd_${generateToken()}`;
-  await db.insert("tokens", { token, created_at: new Date() });
-
-  return Response.json({ token });
-});
-```
-
-## Client Configuration
-
-### Deno Clients
-
-```bash
-# Set registry URL
-export JSR_URL=http://your-private-registry:8080
-
-# Publish as normal
-deno publish
-```
-
-### npm/pnpm/yarn Clients
-
-```ini
-# .npmrc
-@jsr:registry=http://your-private-registry:8080/npm/
-```
-
-### Import Maps (deno.json)
-
-```json
-{
-  "imports": {
-    "@myorg/private-pkg": "http://localhost:8080/@myorg/private-pkg@1.0.0/mod.ts"
+async function handleTaskStatus(taskId: string): Promise<Response> {
+  try {
+    const task = await readJson(`${STORAGE_DIR}/.tasks/${taskId}.json`);
+    return Response.json(task);
+  } catch {
+    return new Response("Task not found", { status: 404 });
   }
 }
 ```
 
-## Minimum Viable Implementation
+### Simple Auth (Auto-Approve)
 
-For the simplest possible private registry, these shortcuts can be taken:
+```typescript
+async function handleAuth(req: Request, path: string): Promise<Response> {
+  // POST /api/authorizations - Start auth flow
+  if (req.method === "POST" && path === "/api/authorizations") {
+    const exchangeToken = crypto.randomUUID();
 
-1. **Skip authentication** - Trust the network for internal use
-2. **Skip npm compatibility** - If only using Deno
-3. **Skip module graph validation** - Trust the publisher
-4. **Use filesystem storage** - Instead of a database for metadata
+    // Auto-approve: write token immediately
+    await Deno.mkdir(STORAGE_DIR, { recursive: true });
+    await Deno.writeTextFile(
+      `${STORAGE_DIR}/.tokens`,
+      exchangeToken + "\n",
+      { append: true }
+    );
 
-This reduces the implementation to:
-- 1 publish endpoint (accept tarball, extract, write files)
-- 1 polling endpoint (return success immediately)
-- File serving with proxy fallback to public jsr.io
+    return Response.json({
+      code: "AUTO",
+      exchange_token: exchangeToken,
+      expires_at: new Date(Date.now() + 600000).toISOString(),
+      poll_interval: 1
+    });
+  }
 
-## Reference Files in JSR Codebase
+  // POST /api/authorizations/exchange - Return token
+  if (req.method === "POST" && path === "/api/authorizations/exchange") {
+    const { exchange_token } = await req.json();
+    return Response.json({ token: `jsrd_${exchange_token}` });
+  }
 
-| Purpose | File Path |
-|---------|-----------|
+  return new Response("Not found", { status: 404 });
+}
+```
+
+### Utility Functions
+
+```typescript
+import { dirname } from "jsr:@std/path";
+import { decodeBase64, encodeHex } from "jsr:@std/encoding";
+
+// Simple gunzip using DecompressionStream
+async function gunzip(data: Uint8Array): Promise<Uint8Array> {
+  const ds = new DecompressionStream("gzip");
+  const writer = ds.writable.getWriter();
+  writer.write(data);
+  writer.close();
+
+  const chunks: Uint8Array[] = [];
+  const reader = ds.readable.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+
+  const result = new Uint8Array(chunks.reduce((a, c) => a + c.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return result;
+}
+
+// Simple tar extraction (handles basic POSIX tar)
+function untar(data: Uint8Array): Map<string, Uint8Array> {
+  const files = new Map<string, Uint8Array>();
+  let offset = 0;
+
+  while (offset < data.length - 512) {
+    const header = data.slice(offset, offset + 512);
+    if (header.every(b => b === 0)) break;
+
+    const name = new TextDecoder().decode(header.slice(0, 100)).replace(/\0.*/, "");
+    const size = parseInt(new TextDecoder().decode(header.slice(124, 136)).trim(), 8);
+    const type = header[156];
+
+    offset += 512;
+
+    if (type === 48 || type === 0) { // Regular file
+      files.set(name, data.slice(offset, offset + size));
+    }
+
+    offset += Math.ceil(size / 512) * 512;
+  }
+
+  return files;
+}
+
+async function writeJson(path: string, data: unknown): Promise<void> {
+  await Deno.mkdir(dirname(path), { recursive: true });
+  await Deno.writeTextFile(path, JSON.stringify(data, null, 2));
+}
+
+async function readJson(path: string): Promise<unknown> {
+  return JSON.parse(await Deno.readTextFile(path));
+}
+
+async function readJsonOr<T>(path: string, fallback: T): Promise<T> {
+  try {
+    return await readJson(path) as T;
+  } catch {
+    return fallback;
+  }
+}
+```
+
+## Client Configuration
+
+```bash
+# Set the registry URL and publish
+export JSR_URL=http://localhost:4873
+deno publish
+```
+
+Or in your shell profile:
+```bash
+export JSR_URL=http://localhost:4873
+```
+
+## Running the Server
+
+```bash
+deno run --allow-net --allow-read --allow-write server.ts
+```
+
+## Configuration
+
+Edit the `PRIVATE_SCOPES` set in server.ts to define which scopes are private:
+
+```typescript
+const PRIVATE_SCOPES = new Set([
+  "mycompany",
+  "internal",
+  "private"
+]);
+```
+
+Any package under these scopes will be stored locally. All other requests proxy to public jsr.io.
+
+## Limitations
+
+This minimal implementation intentionally omits:
+
+- **npm compatibility** - Only works with Deno
+- **Module graph validation** - Trusts the publisher
+- **Documentation generation** - No docs site
+- **Search** - No package discovery
+- **Access control** - All authenticated users can publish to any private scope
+- **Version yanking** - Not implemented
+
+For production use, consider adding these features or using the full JSR implementation.
+
+## Reference Files
+
+Key files in the JSR codebase for understanding the full implementation:
+
+| Purpose | Path |
+|---------|------|
 | Publish endpoint | `api/src/api/package.rs:753-912` |
 | Tarball processing | `api/src/publish.rs` |
-| File validation | `api/src/tarball.rs` |
 | Metadata structures | `api/src/metadata.rs` |
-| Auth flow | `api/src/api/authorization.rs` |
 | Storage paths | `api/src/gcs_paths.rs` |
-| NPM generation | `api/src/npm/mod.rs` |
-| NPM type mapping | `api/src/npm/types.rs` |
-| Import rewriting | `api/src/npm/specifiers.rs` |
-
-## Implementation Phases
-
-### Phase 1: Read-Only Proxy
-- Implement transparent proxy to jsr.io
-- Add local file serving for private packages
-- Manual package placement in storage directory
-
-### Phase 2: Publishing Support
-- Implement publish endpoint
-- Tarball extraction and storage
-- Metadata generation
-
-### Phase 3: Authentication
-- Device OAuth flow
-- Token management
-- Scope-based access control
-
-### Phase 4: npm Compatibility
-- npm manifest generation
-- Tarball creation with transpiled JS
-- Import specifier rewriting (`jsr:` → `@jsr/`)
-
-### Phase 5: Advanced Features
-- Module graph validation
-- Documentation generation
-- Search indexing
-- Web UI for browsing private packages
